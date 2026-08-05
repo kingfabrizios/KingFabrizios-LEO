@@ -40,14 +40,54 @@ AddEventHandler('leo_dispatch:recentIncidents', function(incidents)
     SendNUIMessage({ type = 'initIncidents', incidents = incidents })
 end)
 
+-- Unit updates from AI manager -> forward to NUI
+RegisterNetEvent('leo_dispatch:unitUpdate')
+AddEventHandler('leo_dispatch:unitUpdate', function(unit)
+    SendNUIMessage({ type = 'unitUpdate', unit = unit })
+end)
+
+-- Recent units response from AI manager
+RegisterNetEvent('leo_ai_units:recentUnits')
+AddEventHandler('leo_ai_units:recentUnits', function(units)
+    SendNUIMessage({ type = 'recentUnits', units = units })
+end)
+
 RegisterNUICallback('close', function(data, cb)
     setDisplay(false)
     cb('ok')
 end)
 
--- Listen for dispatch incidents from server and forward to NUI
-RegisterNetEvent('leo_dispatch:incidentCreated')
-AddEventHandler('leo_dispatch:incidentCreated', function(incident)
-    -- Forward to NUI; if MDT isn't open it can still receive (MDT should cache)
-    SendNUIMessage({ type = 'incident', incident = incident })
+-- NUI callback: request units for incident
+RegisterNUICallback('requestUnits', function(data, cb)
+    local incident_id = data.incident_id
+    TriggerServerEvent('leo_ai_units:requestUnits', incident_id)
+    cb('ok')
+end)
+
+-- NUI callback: assign unit for incident
+RegisterNUICallback('assignUnit', function(data, cb)
+    local incident_id = data.incident_id
+    local template = data.template
+    -- Build incident object and trigger server-side assign event
+    local incident = { incident_id = incident_id, coords = template.spawnCoords }
+    TriggerServerEvent('leo_ai_units:assign', incident, template)
+    cb('ok')
+end)
+
+-- For compatibility with our fetch POST endpoints (simple mapping)
+-- The NUI uses fetch('https://leo_mdt/assignUnit', ...)
+RegisterNUICallback('assignUnit', function(data, cb)
+    -- This receiver will be called; it's defined above but keep for clarity
+    local incident_id = data.incident_id
+    local template = data.template
+    local incident = { incident_id = incident_id, coords = template.spawnCoords }
+    TriggerServerEvent('leo_ai_units:assign', incident, template)
+    cb('ok')
+end)
+
+-- Request units endpoint mapping from fetch('https://leo_mdt/requestUnits')
+RegisterNUICallback('requestUnits', function(data, cb)
+    local incident_id = data.incident_id
+    TriggerServerEvent('leo_ai_units:requestUnits', incident_id)
+    cb('ok')
 end)

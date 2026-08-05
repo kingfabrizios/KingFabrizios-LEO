@@ -1,25 +1,20 @@
 <!doctype html>
 <html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>MDT Prototype</title>
-  <link rel="stylesheet" href="style.css">
-</head>
-<body>
-  <div id="app" class="hidden">
-    <header>
-      <h1>MDT Prototype</h1>
-      <button id="closeBtn">Close</button>
-    </header>
-    <main>
-      <section id="incidents">
-        <h2>Active Incidents</h2>
-        <ul id="incidentList"></ul>
-      </section>
-    </main>
-  </div>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MDT - KingFabrizios LEO</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="root"></div>
 
-  <script src="script.js"></script>
-</body>
+    <!-- React + ReactDOM + Babel from CDN for lightweight prototyping -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/babel-standalone@6.26.0/babel.min.js"></script>
+
+    <!-- App script (JSX) -->
+    <script type="text/babel" src="script.js"></script>
+  </body>
 </html>
