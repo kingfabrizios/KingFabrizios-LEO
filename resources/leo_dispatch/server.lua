@@ -46,7 +46,7 @@ end
 local function createIncident(itype, coords, detail)
     incidentCounter = incidentCounter + 1
     local incident = {
-        incident_id = incidentCounter,
+        incident_id = incidentCounter, -- temporary id; will be replaced by DB id when available
         type = itype or "unknown",
         coords = coords or { x = 0.0, y = 0.0, z = 0.0 },
         detail = detail or "",
@@ -54,35 +54,64 @@ local function createIncident(itype, coords, detail)
         created_at = os.time()
     }
 
-    print(('[leo_dispatch] Created incident #%s type=%s'):format(incident.incident_id, incident.type))
+    print(('[leo_dispatch] Creating incident (temp #%s) type=%s'):format(incident.incident_id, incident.type))
 
-    -- Broadcast to all clients (MDT / HUDs)
-    TriggerClientEvent('leo_dispatch:incidentCreated', -1, incident)
-
-    -- Persist to DB if available
+    -- If DB is available, insert first and use DB id as the authoritative incident id
     if exports['oxmysql'] then
-        local sql = "INSERT INTO incidents (incident_id, type, detail, x, y, z, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())"
-        exports.oxmysql:execute(sql, { incident.incident_id, incident.type, incident.detail, incident.coords.x, incident.coords.y, incident.coords.z, incident.status }, function(result)
-            -- oxmysql's callback may return an insert id or affected rows depending on version
-            local dbId = nil
-            if type(result) == 'number' then
-                dbId = result
-            elseif result and result.insertId then
-                dbId = result.insertId
-            end
-            if dbId then
-                incident.db_id = dbId
-                print(('[leo_dispatch] Persisted incident (db id=%s)'):format(dbId))
-            else
-                print('[leo_dispatch] Persisted incident (unknown db id)')
-            end
-        end)
+        local insertSql = "INSERT INTO incidents (incident_id, type, detail, x, y, z, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())"
+        local params = { 0, incident.type, incident.detail, incident.coords.x, incident.coords.y, incident.coords.z, incident.status }
+
+        -- Prefer oxmysql.insert if available (returns insert id in callback)
+        if exports['oxmysql'].insert then
+            exports.oxmysql:insert(insertSql, params, function(insertId)
+                if insertId and tonumber(insertId) then
+                    incident.db_id = tonumber(insertId)
+                    incident.incident_id = incident.db_id
+                    -- update incident_id field so future selects return a meaningful id
+                    local updateSql = "UPDATE incidents SET incident_id = ? WHERE id = ?"
+                    exports.oxmysql:execute(updateSql, { incident.incident_id, incident.db_id })
+                    print(('[leo_dispatch] Persisted incident (db id=%s)'):format(incident.db_id))
+                else
+                    -- fallback: keep runtime id
+                    print('[leo_dispatch] oxmysql.insert returned no insert id; using runtime incident id')
+                end
+
+                -- store and broadcast
+                storeIncidentInMemory(incident)
+                TriggerClientEvent('leo_dispatch:incidentCreated', -1, incident)
+            end)
+        else
+            -- Fallback to execute and attempt to parse result
+            exports.oxmysql:execute(insertSql, params, function(result)
+                local insertId = nil
+                if type(result) == 'number' then
+                    insertId = result
+                elseif result and result.insertId then
+                    insertId = result.insertId
+                end
+
+                if insertId then
+                    incident.db_id = insertId
+                    incident.incident_id = incident.db_id
+                    local updateSql = "UPDATE incidents SET incident_id = ? WHERE id = ?"
+                    exports.oxmysql:execute(updateSql, { incident.incident_id, incident.db_id })
+                    print(('[leo_dispatch] Persisted incident (db id=%s)'):format(incident.db_id))
+                else
+                    print('[leo_dispatch] Failed to determine DB insert id; using runtime incident id')
+                end
+
+                storeIncidentInMemory(incident)
+                TriggerClientEvent('leo_dispatch:incidentCreated', -1, incident)
+            end)
+        end
+
+        return incident
     end
 
-    -- store in memory for quick retrieval
+    -- No DB: store in memory and broadcast using runtime id
+    print(('[leo_dispatch] Created incident #%s type=%s (in-memory only)'):format(incident.incident_id, incident.type))
     storeIncidentInMemory(incident)
-
-    -- TODO: assign AI units, etc.
+    TriggerClientEvent('leo_dispatch:incidentCreated', -1, incident)
     return incident
 end
 
@@ -120,7 +149,7 @@ RegisterNetEvent('leo_dispatch:requestRecentIncidents')
 AddEventHandler('leo_dispatch:requestRecentIncidents', function()
     local src = source
     if exports['oxmysql'] then
-        local sql = "SELECT incident_id, type, detail, x, y, z, status, created_at FROM incidents ORDER BY created_at DESC LIMIT 50"
+        local sql = "SELECT id AS db_id, IF(incident_id=0, id, incident_id) AS incident_id, type, detail, x, y, z, status, created_at FROM incidents ORDER BY created_at DESC LIMIT 50"
         exports.oxmysql:execute(sql, {}, function(results)
             if results then
                 TriggerClientEvent('leo_dispatch:recentIncidents', src, results)

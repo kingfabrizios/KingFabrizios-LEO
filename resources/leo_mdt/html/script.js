@@ -19,7 +19,7 @@
     if (d.type === 'incident') {
       const inc = d.incident
       const li = document.createElement('li')
-      li.textContent = `#${inc.id} [${inc.type}] ${inc.detail || ''}`
+      li.textContent = `#${inc.incident_id || inc.db_id || inc.id} [${inc.type}] ${inc.detail || ''}`
       incidentList.prepend(li)
     }
 
@@ -29,7 +29,7 @@
       for (let i = 0; i < list.length; i++) {
         const inc = list[i]
         const li = document.createElement('li')
-        li.textContent = `#${inc.incident_id or inc.id || inc.incident_id} [${inc.type}] ${inc.detail || ''}`
+        li.textContent = `#${inc.incident_id || inc.db_id || inc.id} [${inc.type}] ${inc.detail || ''}`
         incidentList.appendChild(li)
       }
     }
