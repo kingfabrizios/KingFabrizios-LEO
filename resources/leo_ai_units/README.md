@@ -1,28 +1,14 @@
 leo_ai_units
 
-Simple AI unit management skeleton for KingFabrizios-LEO.
+Added DB persistence for AI units. New file: resources/leo_ai_units/db/schema.sql
 
-This iteration adds spawn limits per host and per incident, queuing on busy hosts, and client-side pooling to reuse ped/vehicle entities.
-
-Highlights:
-- Server:
-  - MAX_UNITS_PER_HOST (default 4) — if a host is at capacity new assignments are queued for that host
-  - MAX_UNITS_PER_INCIDENT (default 6) — prevents runaway assignments for a single incident
-  - pendingQueue per host — queued units are dispatched automatically when the host frees capacity
-- Client:
-  - Pooling for ped/vehicle models (MAX_POOL_PER_MODEL = 3 by default)
-  - Reuses pooled entities when possible to reduce create/delete churn and improve performance
-  - `leo_despawn` command now frees pooled entities instead of outright deleting them
+Behavior:
+- On spawn (clientSpawned), server inserts a record into incidents_units and stores the inserted id on the in-memory unit as db_id.
+- On despawn (clientDespawn), if db_id exists the server updates the DB record with status and despawned_at.
+- MDT/clients can request recent units for an incident via 'leo_ai_units:requestUnits' -> server returns 'leo_ai_units:recentUnits' with results.
 
 Testing:
-1. Ensure feature branch is checked out and resources are placed in your FiveM resources directory.
-2. Add to server.cfg: ensure leo_ai_units (after qb-core and oxmysql if used).
-3. Start server and spawn an incident. From server console run several leo_assign commands to hit the host limit:
-   - leo_assign <incident_id> <x> <y> <z>
-   - Repeat to exceed MAX_UNITS_PER_HOST and observe queued behavior.
-4. On the host client, use /mdt or watch client logs to see spawnRequest handlers. Use the `leo_despawn` command on the host to free pooled entities and observe the server dispatching queued units.
-
-Notes & next steps:
-- You can tune MAX_UNITS_PER_HOST and MAX_UNITS_PER_INCIDENT in resources/leo_ai_units/server.lua.
-- Pooling is model-specific and bounded by MAX_POOL_PER_MODEL on the client; unpooled transient entities are still created if the pool is exhausted.
-- Consider adding persistence for queued assignments and unit records (incidents_units table) for long-running servers.
+1. Ensure oxmysql is configured and available on the server.
+2. Start the server; resource start attempts to create incidents_units table automatically.
+3. Create an incident, assign units, and observe DB rows in incidents_units table.
+4. Request units from a client by triggering 'leo_ai_units:requestUnits' with the incident id (MDT will use this later).
