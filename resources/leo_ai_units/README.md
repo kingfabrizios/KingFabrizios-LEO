@@ -7,8 +7,13 @@ Features:
 - Client spawns entities and reports back net ids and periodic status updates.
 - Debug commands: `leo_assign <incident_id> [x] [y] [z]` on the server console to assign a test unit; `leo_despawn` on client to clear spawned units.
 
+Host selection behavior (new):
+- The server will now prefer players with the job name 'ai_host' (a dedicated host role) when deciding who should spawn AI.
+- If no dedicated host is found, the server will pick the connected player nearest to the incident (or the template spawn coords if provided).
+- If neither strategy can find a player, the server falls back to the first connected player.
+
 Notes & next steps:
-- Host selection is currently naive (first connected player). Replace with nearest-player selection or a dedicated host role.
+- Host selection is improved but still simple. You should create an 'ai_host' job on your server and assign it to a dedicated host machine or admin if you want a stable host.
 - Add pooling and limits to avoid client/server overload.
 - Add persistence (incidents_units table) when stable.
 
@@ -17,4 +22,4 @@ Testing:
 2. Add to server.cfg: ensure leo_ai_units (after qb-core and oxmysql if used).
 3. Start server and spawn an incident. From server console run:
    leo_assign <incident_id> <x> <y> <z>
-4. Check client logs for spawnRequest handling and confirm the MDT updates with unitUpdate events.
+4. The server will choose a host (ai_host or nearest player) and request spawn on that client. Observe logs and MDT unitUpdate events.

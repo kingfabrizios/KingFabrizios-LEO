@@ -5,21 +5,70 @@
 local activeUnits = {}
 local unitCounter = 0
 local incidentToUnits = {}
+local incidentsStore = {}
 local QBCore = exports['qb-core']:GetCoreObject()
 
--- Choose a host player to spawn AI. Simple strategy: pick the first connected player.
--- Later: choose nearest to incident or a dedicated host role.
-local function chooseHostForIncident(incident)
+-- Choose a host player to spawn AI.
+-- Strategy:
+-- 1) Prefer a player with job name 'ai_host' (dedicated host role)
+-- 2) If incident/template coords provided, pick the nearest connected player to those coords
+-- 3) Fallback to the first connected player
+local function chooseHostForIncident(incident, fallbackCoords)
     local players = GetPlayers()
     if not players or #players == 0 then return nil end
-    -- pick the first active player (server id as string) — better strategies can be implemented later
+
+    -- 1) dedicated host role
+    for _, pid in ipairs(players) do
+        local player = tonumber(pid)
+        local ok, ply = pcall(function() return QBCore.Functions.GetPlayer(player) end)
+        if ok and ply and ply.PlayerData and ply.PlayerData.job and ply.PlayerData.job.name == 'ai_host' then
+            print(('[leo_ai_units] Chose dedicated ai_host player %s as host'):format(tostring(player)))
+            return player
+        end
+    end
+
+    -- Determine target coords to compute proximity
+    local tx, ty, tz = nil, nil, nil
+    if incident and incident.coords and incident.coords.x then
+        tx, ty, tz = incident.coords.x, incident.coords.y, incident.coords.z
+    elseif fallbackCoords and fallbackCoords.x then
+        tx, ty, tz = fallbackCoords.x, fallbackCoords.y, fallbackCoords.z
+    end
+
+    -- 2) nearest player to target coords
+    if tx then
+        local best, bestDist = nil, math.huge
+        for _, pid in ipairs(players) do
+            local player = tonumber(pid)
+            local ped = GetPlayerPed(player)
+            if ped and ped > 0 then
+                local px, py, pz = table.unpack(GetEntityCoords(ped, true))
+                local dx = px - tx
+                local dy = py - ty
+                local dz = (pz or 0.0) - (tz or 0.0)
+                local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+                if dist < bestDist then
+                    bestDist = dist
+                    best = player
+                end
+            end
+        end
+        if best then
+            print(('[leo_ai_units] Chose nearest player %s (dist=%.1f) as host for coords (%.1f, %.1f, %.1f)'):format(tostring(best), bestDist, tx, ty, tz))
+            return best
+        end
+    end
+
+    -- 3) fallback to first player
+    print(('[leo_ai_units] No dedicated host or proximate player; falling back to first connected player %s'):format(tostring(players[1])))
     return tonumber(players[1])
 end
 
 -- Assign a single unit to an incident using a template:
 -- template = { unit_type = 'patrol', pedModel = 's_m_y_cop_01', vehicleModel = 'police', spawnCoords = {x,y,z}, behavior = 'drive_to_scene' }
 local function assignUnitToIncident(incident, template)
-    local host = chooseHostForIncident(incident)
+    -- choose host considering incident coords or template spawnCoords as fallback
+    local host = chooseHostForIncident(incident, template and template.spawnCoords)
     if not host then
         print('[leo_ai_units] No host players available to spawn AI')
         return nil
@@ -32,7 +81,7 @@ local function assignUnitToIncident(incident, template)
         unit_type = template.unit_type or 'unit',
         pedModel = template.pedModel,
         vehicleModel = template.vehicleModel,
-        coords = template.spawnCoords or template.coords or { x = 0.0, y = 0.0, z = 0.0 },
+        coords = template.spawnCoords or template.coords or (incident and incident.coords) or { x = 0.0, y = 0.0, z = 0.0 },
         behavior = template.behavior or 'drive_to_scene',
         status = 'queued',
         host = host
@@ -43,7 +92,7 @@ local function assignUnitToIncident(incident, template)
     table.insert(incidentToUnits[unit.incident_id], unit.unit_id)
 
     -- Ask the host client to spawn the unit
-    print(('[leo_ai_units] Requesting spawn of unit %d on host %s'):format(unit.unit_id, tostring(host)))
+    print(('[leo_ai_units] Requesting spawn of unit %d on host %s (coords %.1f, %.1f, %.1f)'):format(unit.unit_id, tostring(host), unit.coords.x, unit.coords.y, unit.coords.z))
     TriggerClientEvent('leo_ai_units:spawnRequest', host, unit)
 
     return unit.unit_id
@@ -64,7 +113,7 @@ RegisterCommand('leo_assign', function(source, args, raw)
 
     local incident_id = tonumber(args[1]) or nil
     if not incident_id then
-        print('Usage: leo_assign <incident_id>')
+        print('Usage: leo_assign <incident_id> [x] [y] [z]')
         return
     end
 
@@ -77,7 +126,7 @@ RegisterCommand('leo_assign', function(source, args, raw)
         behavior = 'drive_to_scene'
     }
 
-    local incident = { incident_id = incident_id }
+    local incident = { incident_id = incident_id, coords = template.spawnCoords }
     local uid = assignUnitToIncident(incident, template)
     if uid then
         print(('[leo_ai_units] Assigned unit %d to incident %d'):format(uid, incident_id))
