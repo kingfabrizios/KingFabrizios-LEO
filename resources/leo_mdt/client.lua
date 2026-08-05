@@ -20,6 +20,8 @@ end, false)
 RegisterNetEvent('leo_mdt:openAuthorized')
 AddEventHandler('leo_mdt:openAuthorized', function(allowed)
     if allowed then
+        -- Request recent incidents from server so MDT can populate on open
+        TriggerServerEvent('leo_dispatch:requestRecentIncidents')
         setDisplay(true)
     else
         -- Use QBCore notification if available
@@ -29,6 +31,13 @@ AddEventHandler('leo_mdt:openAuthorized', function(allowed)
             print('[leo_mdt] Not authorized to open MDT')
         end
     end
+end)
+
+-- Server responds with recent incidents
+RegisterNetEvent('leo_dispatch:recentIncidents')
+AddEventHandler('leo_dispatch:recentIncidents', function(incidents)
+    -- forward to NUI
+    SendNUIMessage({ type = 'initIncidents', incidents = incidents })
 end)
 
 RegisterNUICallback('close', function(data, cb)

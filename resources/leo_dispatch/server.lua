@@ -2,6 +2,7 @@
 -- Dispatch prototype with oxmysql persistence for incidents.
 
 local incidentCounter = 0
+local incidentsStore = {}
 local QBCore = exports['qb-core']:GetCoreObject()
 
 -- Ensure DB table exists on resource start
@@ -32,19 +33,28 @@ AddEventHandler('onResourceStart', function(resourceName)
     end
 end)
 
+-- Utility: add incident to in-memory store (keep recent N)
+local function storeIncidentInMemory(incident)
+    table.insert(incidentsStore, 1, incident)
+    -- keep only last 200 incidents
+    while #incidentsStore > 200 do
+        table.remove(incidentsStore)
+    end
+end
+
 -- Utility: create a simple incident, broadcast, and persist
 local function createIncident(itype, coords, detail)
     incidentCounter = incidentCounter + 1
     local incident = {
-        id = incidentCounter,
+        incident_id = incidentCounter,
         type = itype or "unknown",
         coords = coords or { x = 0.0, y = 0.0, z = 0.0 },
         detail = detail or "",
         status = "pending",
-        createdAt = os.time()
+        created_at = os.time()
     }
 
-    print(('[leo_dispatch] Created incident #%s type=%s'):format(incident.id, incident.type))
+    print(('[leo_dispatch] Created incident #%s type=%s'):format(incident.incident_id, incident.type))
 
     -- Broadcast to all clients (MDT / HUDs)
     TriggerClientEvent('leo_dispatch:incidentCreated', -1, incident)
@@ -52,11 +62,25 @@ local function createIncident(itype, coords, detail)
     -- Persist to DB if available
     if exports['oxmysql'] then
         local sql = "INSERT INTO incidents (incident_id, type, detail, x, y, z, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())"
-        exports.oxmysql:execute(sql, { incident.id, incident.type, incident.detail, incident.coords.x, incident.coords.y, incident.coords.z, incident.status }, function(result)
-            -- result may be insert id or affected rows depending on oxmysql version
-            print(('[leo_dispatch] Persisted incident #%s to DB'):format(incident.id))
+        exports.oxmysql:execute(sql, { incident.incident_id, incident.type, incident.detail, incident.coords.x, incident.coords.y, incident.coords.z, incident.status }, function(result)
+            -- oxmysql's callback may return an insert id or affected rows depending on version
+            local dbId = nil
+            if type(result) == 'number' then
+                dbId = result
+            elseif result and result.insertId then
+                dbId = result.insertId
+            end
+            if dbId then
+                incident.db_id = dbId
+                print(('[leo_dispatch] Persisted incident (db id=%s)'):format(dbId))
+            else
+                print('[leo_dispatch] Persisted incident (unknown db id)')
+            end
         end)
     end
+
+    -- store in memory for quick retrieval
+    storeIncidentInMemory(incident)
 
     -- TODO: assign AI units, etc.
     return incident
@@ -89,4 +113,24 @@ RegisterNetEvent('leo_dispatch:createIncident')
 AddEventHandler('leo_dispatch:createIncident', function(data)
     -- Data should be validated server-side. Here we accept a minimal shape.
     createIncident(data.type, data.coords, data.detail)
+end)
+
+-- Provide recent incidents to clients on request
+RegisterNetEvent('leo_dispatch:requestRecentIncidents')
+AddEventHandler('leo_dispatch:requestRecentIncidents', function()
+    local src = source
+    if exports['oxmysql'] then
+        local sql = "SELECT incident_id, type, detail, x, y, z, status, created_at FROM incidents ORDER BY created_at DESC LIMIT 50"
+        exports.oxmysql:execute(sql, {}, function(results)
+            if results then
+                TriggerClientEvent('leo_dispatch:recentIncidents', src, results)
+            else
+                -- fallback to in-memory store
+                TriggerClientEvent('leo_dispatch:recentIncidents', src, incidentsStore)
+            end
+        end)
+    else
+        -- return in-memory store
+        TriggerClientEvent('leo_dispatch:recentIncidents', src, incidentsStore)
+    end
 end)

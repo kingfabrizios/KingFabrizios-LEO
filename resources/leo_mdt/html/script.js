@@ -19,14 +19,20 @@
     if (d.type === 'incident') {
       const inc = d.incident
       const li = document.createElement('li')
-      li.textContent = `#${inc.id} [${inc.type}] ${inc.detail or ''}`
+      li.textContent = `#${inc.id} [${inc.type}] ${inc.detail || ''}`
       incidentList.prepend(li)
+    }
+
+    if (d.type === 'initIncidents') {
+      const list = d.incidents || []
+      incidentList.innerHTML = ''
+      for (let i = 0; i < list.length; i++) {
+        const inc = list[i]
+        const li = document.createElement('li')
+        li.textContent = `#${inc.incident_id or inc.id || inc.incident_id} [${inc.type}] ${inc.detail || ''}`
+        incidentList.appendChild(li)
+      }
     }
   })
 
-  // Helper for Lua -> NUI to open with cached incidents
-  window.addEventListener('message', (event) => {})
-
-  // expose a global function the client script can call right after opening
-  // client.lua will send NUI messages via SendNUIMessage, which appears as 'message' events
 })();
