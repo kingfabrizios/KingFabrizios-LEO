@@ -1,5 +1,5 @@
 -- resources/leo_ai_units/server.lua
--- Server-side AI unit manager with spawn limits, queuing, DB persistence and host failover.
+-- Server-side AI unit manager with spawn limits, queuing, DB persistence, host failover and persistent queued assignments.
 -- Maintains unit state and requests a client host to spawn AI peds/vehicles.
 
 local activeUnits = {}
@@ -30,9 +30,65 @@ local function countPendingForIncident(incident_id)
     return c
 end
 
--- Ensure DB table exists on resource start (attempt)
+-- Persist a queued unit into DB and set unit.db_id
+local function persistQueuedUnit(unit)
+    if not hasOx then return end
+    local insertSql = "INSERT INTO incidents_units (unit_id, incident_id, unit_type, ped_model, vehicle_model, host, status) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    local params = { unit.unit_id, unit.incident_id, unit.unit_type, unit.pedModel, unit.vehicleModel, unit.host, unit.status }
+    if exports['oxmysql'].insert then
+        exports.oxmysql:insert(insertSql, params, function(insertId)
+            if insertId and tonumber(insertId) then
+                unit.db_id = tonumber(insertId)
+                print(('[leo_ai_units] Persisted queued unit %d as db id %s'):format(unit.unit_id, tostring(unit.db_id)))
+            end
+        end)
+    else
+        exports.oxmysql:execute(insertSql, params, function(result)
+            local insertId = nil
+            if type(result) == 'number' then
+                insertId = result
+            elseif result and result.insertId then
+                insertId = result.insertId
+            end
+            if insertId then
+                unit.db_id = insertId
+                print(('[leo_ai_units] Persisted queued unit %d as db id %s'):format(unit.unit_id, tostring(unit.db_id)))
+            end
+        end)
+    end
+end
+
+-- Update DB record when a unit is spawned (set net_id, status, spawned_at, host)
+local function markUnitSpawnedInDB(unit)
+    if not hasOx or not unit.db_id then return end
+    local sql = "UPDATE incidents_units SET net_id = ?, status = ?, spawned_at = NOW(), host = ? WHERE id = ?"
+    exports.oxmysql:execute(sql, { tostring(unit.netId), unit.status, unit.host, unit.db_id }, function()
+        print(('[leo_ai_units] Updated DB for spawned unit %d (db id=%s)'):format(unit.unit_id, tostring(unit.db_id)))
+    end)
+end
+
+-- Update DB record when a unit is reassigned or queued
+local function updateUnitHostStatusInDB(unit)
+    if not hasOx or not unit.db_id then return end
+    local sql = "UPDATE incidents_units SET host = ?, status = ? WHERE id = ?"
+    exports.oxmysql:execute(sql, { unit.host, unit.status, unit.db_id }, function()
+        print(('[leo_ai_units] Updated DB host/status for unit %d (db id=%s)'):format(unit.unit_id, tostring(unit.db_id)))
+    end)
+end
+
+-- Update DB when unit is despawned
+local function markUnitDespawnedInDB(unit)
+    if not hasOx or not unit.db_id then return end
+    local sql = "UPDATE incidents_units SET status = ?, despawned_at = NOW() WHERE id = ?"
+    exports.oxmysql:execute(sql, { unit.status, unit.db_id }, function()
+        print(('[leo_ai_units] Marked DB unit %d (db id=%s) as despawned'):format(unit.unit_id, tostring(unit.db_id)))
+    end)
+end
+
+-- Ensure DB table exists on resource start and load persistent queued assignments
 AddEventHandler('onResourceStart', function(resourceName)
     if (GetCurrentResourceName() ~= resourceName) then return end
+
     if not hasOx then
         print('[leo_ai_units] oxmysql not available; unit persistence disabled')
         return
@@ -56,32 +112,92 @@ AddEventHandler('onResourceStart', function(resourceName)
 
     exports.oxmysql:execute(schema, {}, function()
         print('[leo_ai_units] incidents_units table ready')
+        -- load max unit_id to continue counters
+        exports.oxmysql:execute("SELECT COALESCE(MAX(unit_id), 0) AS max_unit FROM incidents_units", {}, function(res)
+            if res and res[1] and res[1].max_unit then
+                unitCounter = tonumber(res[1].max_unit) or 0
+                print(('[leo_ai_units] Initialized unitCounter from DB: %d'):format(unitCounter))
+            end
+
+            -- load queued/reassignable units and restore in-memory queues
+            local qsql = "SELECT id, unit_id, incident_id, unit_type, ped_model, vehicle_model, host, net_id, status FROM incidents_units WHERE status IN ('queued','queued_on_host','reassigned','host_lost') ORDER BY id ASC"
+            exports.oxmysql:execute(qsql, {}, function(rows)
+                if rows and #rows > 0 then
+                    print(('[leo_ai_units] Restoring %d queued/reassignable units from DB'):format(#rows))
+                    for _, r in ipairs(rows) do
+                        local u = {
+                            unit_id = tonumber(r.unit_id) or 0,
+                            incident_id = tonumber(r.incident_id) or 0,
+                            unit_type = r.unit_type,
+                            pedModel = r.ped_model,
+                            vehicleModel = r.vehicle_model,
+                            host = r.host and tonumber(r.host) or nil,
+                            netId = r.net_id,
+                            status = r.status or 'queued',
+                            db_id = tonumber(r.id)
+                        }
+                        -- store in activeUnits and incidentToUnits so other logic can reference
+                        activeUnits[u.unit_id] = u
+                        incidentToUnits[u.incident_id] = incidentToUnits[u.incident_id] or {}
+                        table.insert(incidentToUnits[u.incident_id], u.unit_id)
+
+                        -- Decide whether to queue or dispatch immediately
+                        if u.host then
+                            hostActiveCount[u.host] = hostActiveCount[u.host] or 0
+                            if hostActiveCount[u.host] >= MAX_UNITS_PER_HOST then
+                                pendingQueue[u.host] = pendingQueue[u.host] or {}
+                                table.insert(pendingQueue[u.host], u)
+                                u.status = 'queued_on_host'
+                            else
+                                -- dispatch
+                                TriggerClientEvent('leo_ai_units:spawnRequest', u.host, u)
+                                u.status = 'reassigned'
+                            end
+                        else
+                            -- assign to best available host
+                            local chosen = chooseHostForIncident({ incident_id = u.incident_id, coords = nil }, nil, nil)
+                            if chosen then
+                                hostActiveCount[chosen] = hostActiveCount[chosen] or 0
+                                if hostActiveCount[chosen] >= MAX_UNITS_PER_HOST then
+                                    pendingQueue[chosen] = pendingQueue[chosen] or {}
+                                    table.insert(pendingQueue[chosen], u)
+                                    u.status = 'queued_on_host'
+                                    u.host = chosen
+                                else
+                                    TriggerClientEvent('leo_ai_units:spawnRequest', chosen, u)
+                                    u.status = 'reassigned'
+                                    u.host = chosen
+                                end
+                            else
+                                u.status = 'orphaned'
+                                print(('[leo_ai_units] Could not find host to restore unit %d'):format(u.unit_id))
+                            end
+                        end
+
+                        -- update DB with possibly new host/status
+                        updateUnitHostStatusInDB(u)
+                    end
+                end
+            end)
+        end)
     end)
 end)
 
--- Choose a host player to spawn AI.
--- Strategy:
--- 1) Prefer a player with job name 'ai_host' (dedicated host role)
--- 2) If incident/template coords provided, pick the nearest connected player to those coords
--- 3) Fallback to the first connected player
--- Supports optional excludeHost to avoid selecting a recently-disconnected host
+-- Choose host function (reuse existing logic) --------------------------------------------------
 local function chooseHostForIncident(incident, fallbackCoords, excludeHost)
     local players = GetPlayers()
     if not players or #players == 0 then return nil end
 
-    -- 1) dedicated host role
     for _, pid in ipairs(players) do
         local player = tonumber(pid)
         if excludeHost and player == excludeHost then goto continue1 end
         local ok, ply = pcall(function() return QBCore.Functions.GetPlayer(player) end)
         if ok and ply and ply.PlayerData and ply.PlayerData.job and ply.PlayerData.job.name == 'ai_host' then
-            print(('[leo_ai_units] Chose dedicated ai_host player %s as host'):format(tostring(player)))
             return player
         end
         ::continue1::
     end
 
-    -- Determine target coords to compute proximity
     local tx, ty, tz = nil, nil, nil
     if incident and incident.coords and incident.coords.x then
         tx, ty, tz = incident.coords.x, incident.coords.y, incident.coords.z
@@ -89,7 +205,6 @@ local function chooseHostForIncident(incident, fallbackCoords, excludeHost)
         tx, ty, tz = fallbackCoords.x, fallbackCoords.y, fallbackCoords.z
     end
 
-    -- 2) nearest player to target coords
     if tx then
         local best, bestDist = nil, math.huge
         for _, pid in ipairs(players) do
@@ -109,17 +224,12 @@ local function chooseHostForIncident(incident, fallbackCoords, excludeHost)
             end
             ::continue2::
         end
-        if best then
-            print(('[leo_ai_units] Chose nearest player %s (dist=%.1f) as host for coords (%.1f, %.1f, %.1f)'):format(tostring(best), bestDist, tx, ty, tz))
-            return best
-        end
+        if best then return best end
     end
 
-    -- 3) fallback to first player
     for _, pid in ipairs(players) do
         local player = tonumber(pid)
         if excludeHost and player == excludeHost then goto continue3 end
-        print(('[leo_ai_units] No dedicated host or proximate player; falling back to connected player %s'):format(tostring(player)))
         return player
         ::continue3::
     end
@@ -132,9 +242,7 @@ local function reassignUnit(unit, excludeHost)
     if not unit then return false end
     local newHost = chooseHostForIncident({ incident_id = unit.incident_id, coords = unit.coords }, nil, excludeHost)
     if not newHost then
-        print(('[leo_ai_units] No alternate host found to reassign unit %d (incident %s)'):format(unit.unit_id, tostring(unit.incident_id)))
         unit.status = 'orphaned'
-        -- persist status if DB-backed
         if hasOx and unit.db_id then
             exports.oxmysql:execute("UPDATE incidents_units SET status = ? WHERE id = ?", { unit.status, unit.db_id })
         end
@@ -142,8 +250,6 @@ local function reassignUnit(unit, excludeHost)
     end
 
     unit.host = newHost
-
-    -- If new host at capacity, queue on new host
     hostActiveCount[newHost] = hostActiveCount[newHost] or 0
     local activeForIncident = incidentActiveCount[unit.incident_id] or 0
     local pendingForIncident = countPendingForIncident(unit.incident_id)
@@ -151,22 +257,13 @@ local function reassignUnit(unit, excludeHost)
         pendingQueue[newHost] = pendingQueue[newHost] or {}
         table.insert(pendingQueue[newHost], unit)
         unit.status = 'queued_on_host'
-        print(('[leo_ai_units] Reassigned unit %d queued on host %s'):format(unit.unit_id, tostring(newHost)))
-        if hasOx and unit.db_id then
-            exports.oxmysql:execute("UPDATE incidents_units SET host = ?, status = ? WHERE id = ?", { newHost, unit.status, unit.db_id })
-        end
+        updateUnitHostStatusInDB(unit)
         return true
     end
 
-    -- Ask the new host to spawn the unit
-    print(('[leo_ai_units] Reassigning unit %d to host %s'):format(unit.unit_id, tostring(newHost)))
     TriggerClientEvent('leo_ai_units:spawnRequest', newHost, unit)
     unit.status = 'reassigned'
-
-    if hasOx and unit.db_id then
-        exports.oxmysql:execute("UPDATE incidents_units SET host = ?, status = ? WHERE id = ?", { newHost, unit.status, unit.db_id })
-    end
-
+    updateUnitHostStatusInDB(unit)
     return true
 end
 
@@ -174,22 +271,16 @@ end
 local function reassignUnitsFromHost(host)
     print(('[leo_ai_units] Host %s disconnected — reassigning its units and queued tasks'):format(tostring(host)))
 
-    -- Move queued units for this host to other hosts
     local queued = pendingQueue[host] or {}
     pendingQueue[host] = nil
     for _, unit in ipairs(queued) do
-        -- try to reassign; exclude the original host
         reassignUnit(unit, host)
     end
 
-    -- For active units that were spawned/owned by this host, attempt reassignment
     for uid, unit in pairs(activeUnits) do
         if unit.host == host then
-            -- clear hostActiveCount for this host since it disconnected
             hostActiveCount[host] = 0
-            -- If unit was enroute/queued_on_host/reassigned, try to reassign
             if unit.status == 'enroute' or unit.status == 'queued_on_host' or unit.status == 'reassigned' then
-                -- Mark as host_lost and try to reassign
                 unit.status = 'host_lost'
                 local ok = reassignUnit(unit, host)
                 if not ok then
@@ -202,7 +293,6 @@ end
 
 -- Assign a single unit to an incident using a template
 local function assignUnitToIncident(incident, template)
-    -- choose host considering incident coords or template spawnCoords as fallback
     local host = chooseHostForIncident(incident, template and template.spawnCoords)
     if not host then
         print('[leo_ai_units] No host players available to spawn AI')
@@ -210,13 +300,11 @@ local function assignUnitToIncident(incident, template)
     end
 
     local incident_id = incident.incident_id or incident.id or 0
-
-    -- check per-incident limit including queued
     local activeForIncident = incidentActiveCount[incident_id] or 0
     local pendingForIncident = countPendingForIncident(incident_id)
     if (activeForIncident + pendingForIncident) >= MAX_UNITS_PER_INCIDENT then
-        print(('[leo_ai_units] Incident %s has reached max units (%d active + %d pending >= %d)'):
-            format(tostring(incident_id), activeForIncident, pendingForIncident, MAX_UNITS_PER_INCIDENT))
+        print(('[leo_ai_units] Incident %s has reached max units'):
+            format(tostring(incident_id)))
         return nil
     end
 
@@ -239,16 +327,18 @@ local function assignUnitToIncident(incident, template)
 
     hostActiveCount[host] = hostActiveCount[host] or 0
     if hostActiveCount[host] >= MAX_UNITS_PER_HOST then
-        -- queue on that host
         pendingQueue[host] = pendingQueue[host] or {}
         table.insert(pendingQueue[host], unit)
         unit.status = 'queued_on_host'
-        print(('[leo_ai_units] Host %s reached max (%d). Queued unit %d for incident %s'):format(tostring(host), hostActiveCount[host], unit.unit_id, tostring(unit.incident_id)))
+        -- persist queued unit
+        persistQueuedUnit(unit)
         return unit.unit_id
     end
 
+    -- persist queued unit before requesting spawn to ensure recovery if host drops
+    persistQueuedUnit(unit)
+
     -- Ask the host client to spawn the unit
-    print(('[leo_ai_units] Requesting spawn of unit %d on host %s (coords %.1f, %.1f, %.1f)'):format(unit.unit_id, tostring(host), unit.coords.x, unit.coords.y, unit.coords.z))
     TriggerClientEvent('leo_ai_units:spawnRequest', host, unit)
 
     return unit.unit_id
@@ -273,7 +363,6 @@ RegisterCommand('leo_assign', function(source, args, raw)
         return
     end
 
-    -- Build a simple template and call assign
     local template = {
         unit_type = 'patrol',
         pedModel = 's_m_y_cop_01',
@@ -309,42 +398,38 @@ AddEventHandler('leo_ai_units:clientSpawned', function(data)
     hostActiveCount[src] = (hostActiveCount[src] or 0) + 1
     incidentActiveCount[unit.incident_id] = (incidentActiveCount[unit.incident_id] or 0) + 1
 
-    print(('[leo_ai_units] Unit %d spawned by host %s (netId=%s). hostActive=%d incidentActive=%d'):
-        format(unit.unit_id, tostring(src), tostring(unit.netId), hostActiveCount[src], incidentActiveCount[unit.incident_id]))
-
-    -- Persist unit to DB if available
-    if hasOx then
-        local insertSql = "INSERT INTO incidents_units (unit_id, incident_id, unit_type, ped_model, vehicle_model, host, net_id, status, spawned_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())"
-        local params = { unit.unit_id, unit.incident_id, unit.unit_type, unit.pedModel, unit.vehicleModel, unit.host, tostring(unit.netId), unit.status }
-
-        if exports['oxmysql'].insert then
-            exports.oxmysql:insert(insertSql, params, function(insertId)
-                if insertId and tonumber(insertId) then
-                    unit.db_id = tonumber(insertId)
-                    print(('[leo_ai_units] Persisted unit %d as db id %s'):format(unit.unit_id, tostring(unit.db_id)))
-                else
-                    print('[leo_ai_units] oxmysql.insert returned no insert id for unit')
-                end
-            end)
-        else
-            exports.oxmysql:execute(insertSql, params, function(result)
-                local insertId = nil
-                if type(result) == 'number' then
-                    insertId = result
-                elseif result and result.insertId then
-                    insertId = result.insertId
-                end
-                if insertId then
-                    unit.db_id = insertId
-                    print(('[leo_ai_units] Persisted unit %d as db id %s'):format(unit.unit_id, tostring(unit.db_id)))
-                else
-                    print('[leo_ai_units] Failed to determine DB insert id for unit')
-                end
-            end)
+    -- persist spawn in DB if queued previously
+    if unit.db_id then
+        markUnitSpawnedInDB(unit)
+    else
+        -- if it wasn't persisted earlier (no DB row), insert now
+        if hasOx then
+            local insertSql = "INSERT INTO incidents_units (unit_id, incident_id, unit_type, ped_model, vehicle_model, host, net_id, status, spawned_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())"
+            local params = { unit.unit_id, unit.incident_id, unit.unit_type, unit.pedModel, unit.vehicleModel, unit.host, tostring(unit.netId), unit.status }
+            if exports['oxmysql'].insert then
+                exports.oxmysql:insert(insertSql, params, function(insertId)
+                    if insertId and tonumber(insertId) then
+                        unit.db_id = tonumber(insertId)
+                        print(('[leo_ai_units] Persisted spawned unit %d as db id %s'):format(unit.unit_id, tostring(unit.db_id)))
+                    end
+                end)
+            else
+                exports.oxmysql:execute(insertSql, params, function(result)
+                    local insertId = nil
+                    if type(result) == 'number' then
+                        insertId = result
+                    elseif result and result.insertId then
+                        insertId = result.insertId
+                    end
+                    if insertId then
+                        unit.db_id = insertId
+                        print(('[leo_ai_units] Persisted spawned unit %d as db id %s'):format(unit.unit_id, tostring(unit.db_id)))
+                    end
+                end)
+            end
         end
     end
 
-    -- Broadcast update to clients/MDT
     TriggerClientEvent('leo_dispatch:unitUpdate', -1, unit)
 end)
 
@@ -359,7 +444,6 @@ AddEventHandler('leo_ai_units:clientStatus', function(data)
     unit.status = data.status or unit.status
     unit.position = data.position or unit.position
 
-    -- Broadcast to clients/MDT
     TriggerClientEvent('leo_dispatch:unitUpdate', -1, unit)
 end)
 
@@ -374,22 +458,16 @@ AddEventHandler('leo_ai_units:clientDespawn', function(data)
     unit.despawned_at = os.time()
     TriggerClientEvent('leo_dispatch:unitUpdate', -1, unit)
 
-    -- update counters
     local host = unit.host
     if host then
         hostActiveCount[host] = math.max(0, (hostActiveCount[host] or 1) - 1)
     end
     incidentActiveCount[unit.incident_id] = math.max(0, (incidentActiveCount[unit.incident_id] or 1) - 1)
 
-    -- persist despawn time if DB id present
-    if hasOx and unit.db_id then
-        local updateSql = "UPDATE incidents_units SET status = ?, despawned_at = NOW() WHERE id = ?"
-        exports.oxmysql:execute(updateSql, { unit.status, unit.db_id }, function()
-            print(('[leo_ai_units] Updated DB record for unit %d (db id=%s) as despawned'):format(unit.unit_id, tostring(unit.db_id)))
-        end)
+    if unit.db_id then
+        markUnitDespawnedInDB(unit)
     end
 
-    -- remove from activeUnits and incidentToUnits
     activeUnits[data.unit_id] = nil
     local list = incidentToUnits[unit.incident_id]
     if list then
@@ -400,11 +478,9 @@ AddEventHandler('leo_ai_units:clientDespawn', function(data)
         end
     end
 
-    -- If host has a pending queue, dispatch the next queued unit
     if host and pendingQueue[host] and #pendingQueue[host] > 0 then
         local nextUnit = table.remove(pendingQueue[host], 1)
         if nextUnit then
-            print(('[leo_ai_units] Dispatching queued unit %d on host %s'):format(nextUnit.unit_id, tostring(host)))
             TriggerClientEvent('leo_ai_units:spawnRequest', host, nextUnit)
         end
     end
@@ -421,11 +497,15 @@ AddEventHandler('leo_ai_units:requestUnits', function(incident_id)
                 TriggerClientEvent('leo_ai_units:recentUnits', src, results)
                 return
             end
-            -- fallback to in-memory
-            TriggerClientEvent('leo_ai_units:recentUnits', src, incidentToUnits[incident_id] or {})
+            local list = {}
+            local ids = incidentToUnits[incident_id] or {}
+            for _, uid in ipairs(ids) do
+                local u = activeUnits[uid]
+                if u then table.insert(list, u) end
+            end
+            TriggerClientEvent('leo_ai_units:recentUnits', src, list)
         end)
     else
-        -- return in-memory list
         local list = {}
         local ids = incidentToUnits[incident_id] or {}
         for _, uid in ipairs(ids) do
@@ -440,12 +520,7 @@ end)
 AddEventHandler('playerDropped', function(reason)
     local src = source
     if not src then return end
-    print(('[leo_ai_units] playerDropped: %s (reason=%s)'):format(tostring(src), tostring(reason)))
-
-    -- Reassign everything belonging to this host
     reassignUnitsFromHost(src)
-
-    -- Clear any counters/queues for this host
     hostActiveCount[src] = 0
     pendingQueue[src] = nil
 end)
@@ -453,4 +528,4 @@ end)
 -- Export simple helper for server code to request assignment
 exports('assignUnitToIncident', assignUnitToIncident)
 
-print('[leo_ai_units] Server with DB persistence and host failover loaded')
+print('[leo_ai_units] Server with persistent queued assignments loaded')
