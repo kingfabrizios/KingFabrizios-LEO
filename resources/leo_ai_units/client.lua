@@ -1,23 +1,64 @@
 -- resources/leo_ai_units/client.lua
--- Client-side AI host: listens for spawn requests and creates peds/vehicles locally.
+-- Client-side AI host: listens for spawn requests and creates peds/vehicles locally with pooling.
 
 local QBCore = exports['qb-core']:GetCoreObject()
-local spawnedEntities = {}
+local spawnedEntities = {} -- unit_id -> { ped, veh, netId, inUse }
+
+-- Pool structures per model
+local pool = {
+    peds = {},   -- modelHash -> list of { ent = pedEntity, inUse = bool }
+    vehs = {}
+}
+
+local MAX_POOL_PER_MODEL = 3 -- max pooled entities per model on this client
 
 -- Helper: safe model loading
 local function LoadModel(model)
     local mHash = type(model) == 'string' and GetHashKey(model) or model
-    if not IsModelInCdimage(mHash) or not IsModelAMissionEntity(mHash) then
-        -- proceed anyway; common ped/vehicle names will work if present on client
-    end
-
     RequestModel(mHash)
-    local timeout = 50
+    local timeout = 100
     while not HasModelLoaded(mHash) and timeout > 0 do
         Citizen.Wait(50)
         timeout = timeout - 1
     end
     return mHash
+end
+
+local function findFreePoolEntity(list)
+    for i, e in ipairs(list) do
+        if not e.inUse and DoesEntityExist(e.ent) then
+            return i, e
+        end
+    end
+    return nil, nil
+end
+
+local function createPooledPed(modelHash, x, y, z)
+    local ped = CreatePed(4, modelHash, x, y, z + 0.5, 0.0, true, false)
+    SetPedAsCop(ped, true)
+    SetEntityAsMissionEntity(ped, true, true)
+    return ped
+end
+
+local function createPooledVehicle(modelHash, x, y, z)
+    local veh = CreateVehicle(modelHash, x, y, z + 0.5, 0.0, true, false)
+    SetVehicleOnGroundProperly(veh)
+    SetEntityAsMissionEntity(veh, true, true)
+    return veh
+end
+
+-- Mark pooled entity as free (do not delete immediately)
+local function freePooledEntity(ent, list)
+    if not ent then return end
+    -- move off-map and clear tasks
+    if DoesEntityExist(ent) then
+        SetEntityCoords(ent, 0.0, 0.0, -1000.0, false, false, false, true)
+        if IsEntityAPed(ent) then
+            ClearPedTasksImmediately(ent)
+        elseif IsEntityAVehicle(ent) then
+            SetEntityAsNoLongerNeeded(ent)
+        end
+    end
 end
 
 RegisterNetEvent('leo_ai_units:spawnRequest')
@@ -35,36 +76,64 @@ AddEventHandler('leo_ai_units:spawnRequest', function(unit)
     local createdPed = nil
     local createdVeh = nil
 
+    -- Vehicle pooling
     if vehHash then
-        createdVeh = CreateVehicle(vehHash, x, y, z + 0.5, 0.0, true, false)
-        SetVehicleOnGroundProperly(createdVeh)
-        SetEntityAsMissionEntity(createdVeh, true, true)
+        pool.vehs[vehHash] = pool.vehs[vehHash] or {}
+        local idx, entry = findFreePoolEntity(pool.vehs[vehHash])
+        if entry then
+            -- reuse vehicle
+            createdVeh = entry.ent
+            pool.vehs[vehHash][idx].inUse = true
+            SetEntityCoords(createdVeh, x, y, z + 0.5, false, false, false, true)
+            SetVehicleOnGroundProperly(createdVeh)
+        else
+            -- create new if pool not exceeded
+            if #pool.vehs[vehHash] < MAX_POOL_PER_MODEL then
+                createdVeh = createPooledVehicle(vehHash, x, y, z)
+                table.insert(pool.vehs[vehHash], { ent = createdVeh, inUse = true })
+            else
+                -- pool exhausted for this model; create a transient vehicle (not pooled)
+                createdVeh = createPooledVehicle(vehHash, x, y, z)
+            end
+        end
     end
 
+    -- Ped pooling
     if pedHash then
-        createdPed = CreatePed(4, pedHash, x, y, z + 0.5, 0.0, true, false)
-        SetPedAsCop(createdPed, true)
-        SetEntityAsMissionEntity(createdPed, true, true)
-        if createdVeh then
-            TaskWarpPedIntoVehicle(createdPed, createdVeh, -1)
+        pool.peds[pedHash] = pool.peds[pedHash] or {}
+        local idx, entry = findFreePoolEntity(pool.peds[pedHash])
+        if entry then
+            createdPed = entry.ent
+            pool.peds[pedHash][idx].inUse = true
+            SetEntityCoords(createdPed, x, y, z + 0.5, false, false, false, true)
+            ClearPedTasksImmediately(createdPed)
         else
-            -- simple behavior: walk to the target coords if specified
-            TaskGoStraightToCoord(createdPed, x, y, z, 1.0, -1, 0.0, 0.0)
+            if #pool.peds[pedHash] < MAX_POOL_PER_MODEL then
+                createdPed = createPooledPed(pedHash, x, y, z)
+                table.insert(pool.peds[pedHash], { ent = createdPed, inUse = true })
+            else
+                -- create a transient ped
+                createdPed = createPooledPed(pedHash, x, y, z)
+            end
         end
+    end
+
+    if createdPed and createdVeh then
+        TaskWarpPedIntoVehicle(createdPed, createdVeh, -1)
+    elseif createdPed and not createdVeh then
+        TaskGoStraightToCoord(createdPed, x, y, z, 1.0, -1, 0.0, 0.0)
     end
 
     -- Network ownership: ensure entity is networked so server & others can see it
     local netId = nil
-    if createdPed and DoesEntityExist(createdPed) then
-        netId = NetworkGetNetworkIdFromEntity(createdPed)
-        SetNetworkIdCanMigrate(netId, true)
-    elseif createdVeh and DoesEntityExist(createdVeh) then
-        netId = NetworkGetNetworkIdFromEntity(createdVeh)
+    local entityToNetwork = createdPed and createdPed or createdVeh
+    if entityToNetwork and DoesEntityExist(entityToNetwork) then
+        netId = NetworkGetNetworkIdFromEntity(entityToNetwork)
         SetNetworkIdCanMigrate(netId, true)
     end
 
     if netId then
-        spawnedEntities[unit.unit_id] = { ped = createdPed, veh = createdVeh, netId = netId }
+        spawnedEntities[unit.unit_id] = { ped = createdPed, veh = createdVeh, netId = netId, modelPed = pedHash, modelVeh = vehHash }
         -- report back to server that the unit is spawned
         TriggerServerEvent('leo_ai_units:clientSpawned', { unit_id = unit.unit_id, netId = netId, entityType = (createdPed and 'ped' or 'vehicle') })
 
@@ -79,6 +148,7 @@ AddEventHandler('leo_ai_units:spawnRequest', function(unit)
                 else
                     -- entity missing: report despawn and cleanup
                     TriggerServerEvent('leo_ai_units:clientDespawn', { unit_id = unit.unit_id })
+                    -- cleanup local tracking
                     spawnedEntities[unit.unit_id] = nil
                     break
                 end
@@ -90,19 +160,44 @@ AddEventHandler('leo_ai_units:spawnRequest', function(unit)
     end
 end)
 
--- Simple cleanup command for clients to despawn an assigned unit locally
+-- Simple cleanup command for clients to free pooled spawned units locally
 RegisterCommand('leo_despawn', function()
-    -- debug CLI: despawn all spawnedEntities on this client
+    -- debug CLI: free all spawnedEntities on this client (return to pool)
     for uid, ent in pairs(spawnedEntities) do
         if ent.ped and DoesEntityExist(ent.ped) then
-            DeletePed(ent.ped)
+            -- mark ped free in pool if pooled
+            local model = ent.modelPed
+            if model and pool.peds[model] then
+                for i, e in ipairs(pool.peds[model]) do
+                    if e.ent == ent.ped then
+                        e.inUse = false
+                        freePooledEntity(e.ent)
+                        break
+                    end
+                end
+            else
+                -- not pooled: delete
+                DeletePed(ent.ped)
+            end
         end
         if ent.veh and DoesEntityExist(ent.veh) then
-            DeleteVehicle(ent.veh)
+            local model = ent.modelVeh
+            if model and pool.vehs[model] then
+                for i, e in ipairs(pool.vehs[model]) do
+                    if e.ent == ent.veh then
+                        e.inUse = false
+                        freePooledEntity(e.ent)
+                        break
+                    end
+                end
+            else
+                DeleteVehicle(ent.veh)
+            end
         end
+
         spawnedEntities[uid] = nil
         TriggerServerEvent('leo_ai_units:clientDespawn', { unit_id = uid })
     end
 end, false)
 
-print('[leo_ai_units] Client loaded')
+print('[leo_ai_units] Client loaded with pooling support')

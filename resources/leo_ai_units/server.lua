@@ -1,5 +1,5 @@
 -- resources/leo_ai_units/server.lua
--- Server-side AI unit manager (skeleton).
+-- Server-side AI unit manager (skeleton with spawn limits & queuing)
 -- Maintains unit state and requests a client host to spawn AI peds/vehicles.
 
 local activeUnits = {}
@@ -7,6 +7,25 @@ local unitCounter = 0
 local incidentToUnits = {}
 local incidentsStore = {}
 local QBCore = exports['qb-core']:GetCoreObject()
+
+-- Limits
+local MAX_UNITS_PER_HOST = 4
+local MAX_UNITS_PER_INCIDENT = 6
+
+-- runtime counters & queues
+local hostActiveCount = {}         -- hostId -> number of active (spawned) units
+local incidentActiveCount = {}     -- incident_id -> number of active (spawned) units
+local pendingQueue = {}            -- hostId -> list of queued unit objects awaiting spawn on that host
+
+local function countPendingForIncident(incident_id)
+    local c = 0
+    for _, list in pairs(pendingQueue) do
+        for _, u in ipairs(list) do
+            if u.incident_id == incident_id then c = c + 1 end
+        end
+    end
+    return c
+end
 
 -- Choose a host player to spawn AI.
 -- Strategy:
@@ -74,10 +93,21 @@ local function assignUnitToIncident(incident, template)
         return nil
     end
 
+    local incident_id = incident.incident_id or incident.id or 0
+
+    -- check per-incident limit including queued
+    local activeForIncident = incidentActiveCount[incident_id] or 0
+    local pendingForIncident = countPendingForIncident(incident_id)
+    if (activeForIncident + pendingForIncident) >= MAX_UNITS_PER_INCIDENT then
+        print(('[leo_ai_units] Incident %s has reached max units (%d active + %d pending >= %d)'):
+            format(tostring(incident_id), activeForIncident, pendingForIncident, MAX_UNITS_PER_INCIDENT))
+        return nil
+    end
+
     unitCounter = unitCounter + 1
     local unit = {
         unit_id = unitCounter,
-        incident_id = incident.incident_id or incident.id or 0,
+        incident_id = incident_id,
         unit_type = template.unit_type or 'unit',
         pedModel = template.pedModel,
         vehicleModel = template.vehicleModel,
@@ -90,6 +120,16 @@ local function assignUnitToIncident(incident, template)
     activeUnits[unit.unit_id] = unit
     incidentToUnits[unit.incident_id] = incidentToUnits[unit.incident_id] or {}
     table.insert(incidentToUnits[unit.incident_id], unit.unit_id)
+
+    hostActiveCount[host] = hostActiveCount[host] or 0
+    if hostActiveCount[host] >= MAX_UNITS_PER_HOST then
+        -- queue on that host
+        pendingQueue[host] = pendingQueue[host] or {}
+        table.insert(pendingQueue[host], unit)
+        unit.status = 'queued_on_host'
+        print(('[leo_ai_units] Host %s reached max (%d). Queued unit %d for incident %s'):format(tostring(host), hostActiveCount[host], unit.unit_id, tostring(unit.incident_id)))
+        return unit.unit_id
+    end
 
     -- Ask the host client to spawn the unit
     print(('[leo_ai_units] Requesting spawn of unit %d on host %s (coords %.1f, %.1f, %.1f)'):format(unit.unit_id, tostring(host), unit.coords.x, unit.coords.y, unit.coords.z))
@@ -149,7 +189,12 @@ AddEventHandler('leo_ai_units:clientSpawned', function(data)
     unit.status = 'enroute'
     unit.host = src
 
-    print(('[leo_ai_units] Unit %d spawned by host %s (netId=%s)'):format(unit.unit_id, tostring(src), tostring(unit.netId)))
+    -- update counters
+    hostActiveCount[src] = (hostActiveCount[src] or 0) + 1
+    incidentActiveCount[unit.incident_id] = (incidentActiveCount[unit.incident_id] or 0) + 1
+
+    print(('[leo_ai_units] Unit %d spawned by host %s (netId=%s). hostActive=%d incidentActive=%d'):
+        format(unit.unit_id, tostring(src), tostring(unit.netId), hostActiveCount[src], incidentActiveCount[unit.incident_id]))
 
     -- Broadcast update to clients/MDT
     TriggerClientEvent('leo_dispatch:unitUpdate', -1, unit)
@@ -181,6 +226,13 @@ AddEventHandler('leo_ai_units:clientDespawn', function(data)
     unit.despawned_at = os.time()
     TriggerClientEvent('leo_dispatch:unitUpdate', -1, unit)
 
+    -- update counters
+    local host = unit.host
+    if host then
+        hostActiveCount[host] = math.max(0, (hostActiveCount[host] or 1) - 1)
+    end
+    incidentActiveCount[unit.incident_id] = math.max(0, (incidentActiveCount[unit.incident_id] or 1) - 1)
+
     -- remove from activeUnits and incidentToUnits
     activeUnits[data.unit_id] = nil
     local list = incidentToUnits[unit.incident_id]
@@ -191,9 +243,18 @@ AddEventHandler('leo_ai_units:clientDespawn', function(data)
             end
         end
     end
+
+    -- If host has a pending queue, dispatch the next queued unit
+    if host and pendingQueue[host] and #pendingQueue[host] > 0 then
+        local nextUnit = table.remove(pendingQueue[host], 1)
+        if nextUnit then
+            print(('[leo_ai_units] Dispatching queued unit %d on host %s'):format(nextUnit.unit_id, tostring(host)))
+            TriggerClientEvent('leo_ai_units:spawnRequest', host, nextUnit)
+        end
+    end
 end)
 
 -- Export simple helper for server code to request assignment
 exports('assignUnitToIncident', assignUnitToIncident)
 
-print('[leo_ai_units] Server loaded')
+print('[leo_ai_units] Server with spawn limits & queuing loaded')
