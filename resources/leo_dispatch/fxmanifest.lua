@@ -7,5 +7,6 @@ version '0.1.0'
 
 server_script 'server.lua'
 
--- declare dependency on qb-core (integration points to be implemented)
+-- declare dependencies on qb-core and oxmysql (DB persistence)
 dependency 'qb-core'
+dependency 'oxmysql'

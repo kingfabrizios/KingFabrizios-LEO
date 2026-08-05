@@ -1,18 +1,35 @@
 -- leo_mdt/client.lua
--- Minimal client-side MDT integration: opens NUI and listens for dispatch events
+-- Client-side MDT integration with QBCore permission request: opens NUI only for authorized users
 
+local QBCore = exports['qb-core']:GetCoreObject()
 local display = false
 
--- Open MDT UI
+-- Open MDT UI locally
 local function setDisplay(bool)
     display = bool
     SetNuiFocus(bool, bool)
     SendNUIMessage({ type = 'toggle', display = bool })
 end
 
+-- Request open from server (server will validate permissions)
 RegisterCommand('mdt', function()
-    setDisplay(true)
+    TriggerServerEvent('leo_mdt:requestOpen')
 end, false)
+
+-- Server response: open if authorized
+RegisterNetEvent('leo_mdt:openAuthorized')
+AddEventHandler('leo_mdt:openAuthorized', function(allowed)
+    if allowed then
+        setDisplay(true)
+    else
+        -- Use QBCore notification if available
+        if QBCore and QBCore.Functions and QBCore.Functions.Notify then
+            QBCore.Functions.Notify('You are not authorized to use the MDT.', 'error')
+        else
+            print('[leo_mdt] Not authorized to open MDT')
+        end
+    end
+end)
 
 RegisterNUICallback('close', function(data, cb)
     setDisplay(false)

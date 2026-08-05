@@ -14,6 +14,7 @@ files {
 }
 
 client_script 'client.lua'
+server_script 'server.lua'
 
 -- depends on qb-core for permissions/integration
 dependency 'qb-core'
