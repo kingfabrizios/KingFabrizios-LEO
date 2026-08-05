@@ -1,5 +1,6 @@
 -- resources/leo_ai_units/server.lua
--- Server-side AI unit manager with DB persistence for unit records (incidents_units table).
+-- Server-side AI unit manager with spawn limits, queuing, DB persistence and host failover.
+-- Maintains unit state and requests a client host to spawn AI peds/vehicles.
 
 local activeUnits = {}
 local unitCounter = 0
@@ -59,18 +60,25 @@ AddEventHandler('onResourceStart', function(resourceName)
 end)
 
 -- Choose a host player to spawn AI.
-local function chooseHostForIncident(incident, fallbackCoords)
+-- Strategy:
+-- 1) Prefer a player with job name 'ai_host' (dedicated host role)
+-- 2) If incident/template coords provided, pick the nearest connected player to those coords
+-- 3) Fallback to the first connected player
+-- Supports optional excludeHost to avoid selecting a recently-disconnected host
+local function chooseHostForIncident(incident, fallbackCoords, excludeHost)
     local players = GetPlayers()
     if not players or #players == 0 then return nil end
 
     -- 1) dedicated host role
     for _, pid in ipairs(players) do
         local player = tonumber(pid)
+        if excludeHost and player == excludeHost then goto continue1 end
         local ok, ply = pcall(function() return QBCore.Functions.GetPlayer(player) end)
         if ok and ply and ply.PlayerData and ply.PlayerData.job and ply.PlayerData.job.name == 'ai_host' then
             print(('[leo_ai_units] Chose dedicated ai_host player %s as host'):format(tostring(player)))
             return player
         end
+        ::continue1::
     end
 
     -- Determine target coords to compute proximity
@@ -86,6 +94,7 @@ local function chooseHostForIncident(incident, fallbackCoords)
         local best, bestDist = nil, math.huge
         for _, pid in ipairs(players) do
             local player = tonumber(pid)
+            if excludeHost and player == excludeHost then goto continue2 end
             local ped = GetPlayerPed(player)
             if ped and ped > 0 then
                 local px, py, pz = table.unpack(GetEntityCoords(ped, true))
@@ -98,6 +107,7 @@ local function chooseHostForIncident(incident, fallbackCoords)
                     best = player
                 end
             end
+            ::continue2::
         end
         if best then
             print(('[leo_ai_units] Chose nearest player %s (dist=%.1f) as host for coords (%.1f, %.1f, %.1f)'):format(tostring(best), bestDist, tx, ty, tz))
@@ -106,8 +116,88 @@ local function chooseHostForIncident(incident, fallbackCoords)
     end
 
     -- 3) fallback to first player
-    print(('[leo_ai_units] No dedicated host or proximate player; falling back to first connected player %s'):format(tostring(players[1])))
-    return tonumber(players[1])
+    for _, pid in ipairs(players) do
+        local player = tonumber(pid)
+        if excludeHost and player == excludeHost then goto continue3 end
+        print(('[leo_ai_units] No dedicated host or proximate player; falling back to connected player %s'):format(tostring(player)))
+        return player
+        ::continue3::
+    end
+
+    return nil
+end
+
+-- Reassign a unit to a different host (preserves unit_id)
+local function reassignUnit(unit, excludeHost)
+    if not unit then return false end
+    local newHost = chooseHostForIncident({ incident_id = unit.incident_id, coords = unit.coords }, nil, excludeHost)
+    if not newHost then
+        print(('[leo_ai_units] No alternate host found to reassign unit %d (incident %s)'):format(unit.unit_id, tostring(unit.incident_id)))
+        unit.status = 'orphaned'
+        -- persist status if DB-backed
+        if hasOx and unit.db_id then
+            exports.oxmysql:execute("UPDATE incidents_units SET status = ? WHERE id = ?", { unit.status, unit.db_id })
+        end
+        return false
+    end
+
+    unit.host = newHost
+
+    -- If new host at capacity, queue on new host
+    hostActiveCount[newHost] = hostActiveCount[newHost] or 0
+    local activeForIncident = incidentActiveCount[unit.incident_id] or 0
+    local pendingForIncident = countPendingForIncident(unit.incident_id)
+    if hostActiveCount[newHost] >= MAX_UNITS_PER_HOST or (activeForIncident + pendingForIncident) >= MAX_UNITS_PER_INCIDENT then
+        pendingQueue[newHost] = pendingQueue[newHost] or {}
+        table.insert(pendingQueue[newHost], unit)
+        unit.status = 'queued_on_host'
+        print(('[leo_ai_units] Reassigned unit %d queued on host %s'):format(unit.unit_id, tostring(newHost)))
+        if hasOx and unit.db_id then
+            exports.oxmysql:execute("UPDATE incidents_units SET host = ?, status = ? WHERE id = ?", { newHost, unit.status, unit.db_id })
+        end
+        return true
+    end
+
+    -- Ask the new host to spawn the unit
+    print(('[leo_ai_units] Reassigning unit %d to host %s'):format(unit.unit_id, tostring(newHost)))
+    TriggerClientEvent('leo_ai_units:spawnRequest', newHost, unit)
+    unit.status = 'reassigned'
+
+    if hasOx and unit.db_id then
+        exports.oxmysql:execute("UPDATE incidents_units SET host = ?, status = ? WHERE id = ?", { newHost, unit.status, unit.db_id })
+    end
+
+    return true
+end
+
+-- Reassign all units and queued assignments for a host that disconnected
+local function reassignUnitsFromHost(host)
+    print(('[leo_ai_units] Host %s disconnected — reassigning its units and queued tasks'):format(tostring(host)))
+
+    -- Move queued units for this host to other hosts
+    local queued = pendingQueue[host] or {}
+    pendingQueue[host] = nil
+    for _, unit in ipairs(queued) do
+        -- try to reassign; exclude the original host
+        reassignUnit(unit, host)
+    end
+
+    -- For active units that were spawned/owned by this host, attempt reassignment
+    for uid, unit in pairs(activeUnits) do
+        if unit.host == host then
+            -- clear hostActiveCount for this host since it disconnected
+            hostActiveCount[host] = 0
+            -- If unit was enroute/queued_on_host/reassigned, try to reassign
+            if unit.status == 'enroute' or unit.status == 'queued_on_host' or unit.status == 'reassigned' then
+                -- Mark as host_lost and try to reassign
+                unit.status = 'host_lost'
+                local ok = reassignUnit(unit, host)
+                if not ok then
+                    print(('[leo_ai_units] Could not reassign active unit %d; marked orphaned'):format(uid))
+                end
+            end
+        end
+    end
 end
 
 -- Assign a single unit to an incident using a template
@@ -346,7 +436,21 @@ AddEventHandler('leo_ai_units:requestUnits', function(incident_id)
     end
 end)
 
+-- Player disconnect handler: reassign queued & active units owned by the disconnected host
+AddEventHandler('playerDropped', function(reason)
+    local src = source
+    if not src then return end
+    print(('[leo_ai_units] playerDropped: %s (reason=%s)'):format(tostring(src), tostring(reason)))
+
+    -- Reassign everything belonging to this host
+    reassignUnitsFromHost(src)
+
+    -- Clear any counters/queues for this host
+    hostActiveCount[src] = 0
+    pendingQueue[src] = nil
+end)
+
 -- Export simple helper for server code to request assignment
 exports('assignUnitToIncident', assignUnitToIncident)
 
-print('[leo_ai_units] Server with DB persistence loaded')
+print('[leo_ai_units] Server with DB persistence and host failover loaded')
