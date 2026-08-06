@@ -1,11 +1,48 @@
 const { useState, useEffect } = React
 
+function HostRow({ h, onOpen }) {
+  const stale = h.heartbeatAge && h.heartbeatAge > 12
+  return (
+    <li className={stale ? 'stale' : ''} onClick={() => onOpen(h)}>
+      <div><strong>{h.name || ('Host ' + h.hostId)}</strong> {h.isDedicated ? '(ai_host)' : ''}</div>
+      <div>Last HB: {h.lastHeartbeat ? new Date(h.lastHeartbeat * 1000).toLocaleString() : 'never'} ({h.heartbeatAge ? `${h.heartbeatAge}s ago` : 'N/A'})</div>
+      <div>Active: {h.activeCount} | Queued: {h.queuedCount}</div>
+    </li>
+  )
+}
+
+function HostDetailModal({ detail, onClose, onSetMaintenance }) {
+  if (!detail) return null
+  return (
+    <div className="modal">
+      <div className="modal-content">
+        <h3>Host {detail.hostId} — Detail</h3>
+        <div>Position: {detail.position ? `${detail.position.x.toFixed(1)}, ${detail.position.y.toFixed(1)}` : 'N/A'}</div>
+        <div>Heartbeat: {detail.heartbeat ? new Date(detail.heartbeat * 1000).toLocaleString() : 'N/A'}</div>
+        <div>Active: {detail.activeCount} | Queued: {detail.queuedCount}</div>
+        <h4>Units</h4>
+        <ul>
+          {detail.units.map(u => (
+            <li key={u.unit_id}>Unit {u.unit_id} — {u.unit_type} — {u.status}</li>
+          ))}
+        </ul>
+        <div className="modal-actions">
+          <button onClick={() => onSetMaintenance(detail.hostId, true)}>Set Maintenance</button>
+          <button onClick={() => onSetMaintenance(detail.hostId, false)}>Clear Maintenance</button>
+          <button onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function App() {
   const [visible, setVisible] = useState(false)
   const [incidents, setIncidents] = useState([])
   const [selectedIncident, setSelectedIncident] = useState(null)
   const [units, setUnits] = useState([])
   const [hosts, setHosts] = useState([])
+  const [detail, setDetail] = useState(null)
 
   useEffect(() => {
     window.addEventListener('message', handleMessage)
@@ -32,6 +69,11 @@ function App() {
     }
     if (d.type === 'recentUnits') setUnits(d.units || [])
     if (d.type === 'hostsStatus') setHosts(d.hosts || [])
+    if (d.type === 'hostDetail') setDetail(d.detail)
+    if (d.type === 'hostsStatusUpdate') {
+      // refresh list on update
+      fetch('https://leo_mdt/requestHosts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
+    }
   }
 
   function close() {
@@ -41,15 +83,12 @@ function App() {
   function selectIncident(inc) {
     setSelectedIncident(inc)
     setUnits([])
-    // request recent units for incident from the client-side script
     fetch('https://leo_mdt/requestUnits', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ incident_id: inc.incident_id || inc.id }) })
-    // also request host status to show health
     fetch('https://leo_mdt/requestHosts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
   }
 
   function assignUnit() {
     if (!selectedIncident) return
-    // simple template for patrol unit; in future expose as UI form
     const template = {
       unit_type: 'patrol',
       pedModel: 's_m_y_cop_01',
@@ -63,6 +102,17 @@ function App() {
 
   function refreshHosts() {
     fetch('https://leo_mdt/requestHosts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
+  }
+
+  function openHostDetail(h) {
+    fetch('https://leo_mdt/requestHostDetail', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hostId: h.hostId }) })
+  }
+
+  function closeDetail() { setDetail(null) }
+
+  function setMaintenance(hostId, enable) {
+    fetch('https://leo_mdt/setHostMaintenance', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hostId, enable }) })
+    setDetail(null)
   }
 
   if (!visible) return null
@@ -98,11 +148,7 @@ function App() {
             {hosts.length === 0 && <div className="empty">No hosts</div>}
             <ul>
               {hosts.map(h => (
-                <li key={h.hostId} className={h.heartbeatAge && h.heartbeatAge > 12 ? 'stale' : ''}>
-                  <div><strong>Host {h.hostId}</strong> {h.isDedicated ? '(ai_host)' : ''}</div>
-                  <div>Last HB: {h.lastHeartbeat ? new Date(h.lastHeartbeat * 1000).toLocaleString() : 'never'} ({h.heartbeatAge ? `${h.heartbeatAge}s ago` : 'N/A'})</div>
-                  <div>Active: {h.activeCount} | Queued: {h.queuedCount}</div>
-                </li>
+                <HostRow key={h.hostId} h={h} onOpen={openHostDetail} />
               ))}
             </ul>
           </div>
@@ -122,6 +168,8 @@ function App() {
           </div>
         </section>
       </main>
+
+      <HostDetailModal detail={detail} onClose={closeDetail} onSetMaintenance={setMaintenance} />
     </div>
   )
 }
