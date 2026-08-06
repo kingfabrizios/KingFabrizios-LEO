@@ -1,9 +1,10 @@
-const { useState, useEffect } = React
+const { useState, useEffect, useRef } = React
 
-function HostRow({ h, onOpen }) {
-  const stale = h.heartbeatAge && h.heartbeatAge > 12
+function HostRow({ h, onOpen, threshold }) {
+  const stale = h.heartbeatAge && h.heartbeatAge > threshold.warn
+  const critical = h.queuedCount >= threshold.queued || (h.heartbeatAge && h.heartbeatAge > threshold.critical)
   return (
-    <li className={stale ? 'stale' : ''} onClick={() => onOpen(h)}>
+    <li className={stale ? 'stale' : (critical ? 'critical' : '')} onClick={() => onOpen(h)}>
       <div><strong>{h.name || ('Host ' + h.hostId)}</strong> {h.isDedicated ? '(ai_host)' : ''}</div>
       <div>Last HB: {h.lastHeartbeat ? new Date(h.lastHeartbeat * 1000).toLocaleString() : 'never'} ({h.heartbeatAge ? `${h.heartbeatAge}s ago` : 'N/A'})</div>
       <div>Active: {h.activeCount} | Queued: {h.queuedCount}</div>
@@ -36,6 +37,36 @@ function HostDetailModal({ detail, onClose, onSetMaintenance }) {
   )
 }
 
+function MapPanel({ hosts }) {
+  const mapRef = useRef(null)
+  const markersRef = useRef({})
+
+  useEffect(() => {
+    if (!mapRef.current) {
+      // initialize simple CRS map for plotting game coordinates
+      mapRef.current = L.map('map', { crs: L.CRS.Simple, minZoom: -5 }).setView([0,0], 0)
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '' }).addTo(mapRef.current)
+    }
+  }, [])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    // update markers
+    Object.values(markersRef.current).forEach(m => map.removeLayer(m))
+    markersRef.current = {}
+    hosts.forEach(h => {
+      if (!h.position) return
+      const lat = h.position.y || 0
+      const lng = h.position.x || 0
+      const marker = L.marker([lat, lng]).addTo(map).bindPopup(`${h.name || ('Host ' + h.hostId)}<br/>Active:${h.activeCount} Queued:${h.queuedCount}`)
+      markersRef.current[h.hostId] = marker
+    })
+  }, [hosts])
+
+  return <div id="map" style={{ height: '180px', width: '100%', marginBottom: '8px' }}></div>
+}
+
 function App() {
   const [visible, setVisible] = useState(false)
   const [incidents, setIncidents] = useState([])
@@ -43,6 +74,7 @@ function App() {
   const [units, setUnits] = useState([])
   const [hosts, setHosts] = useState([])
   const [detail, setDetail] = useState(null)
+  const [threshold, setThreshold] = useState({ queued: 3, warn: 12, critical: 20 })
 
   useEffect(() => {
     window.addEventListener('message', handleMessage)
@@ -71,7 +103,6 @@ function App() {
     if (d.type === 'hostsStatus') setHosts(d.hosts || [])
     if (d.type === 'hostDetail') setDetail(d.detail)
     if (d.type === 'hostsStatusUpdate') {
-      // refresh list on update
       fetch('https://leo_mdt/requestHosts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
     }
   }
@@ -115,7 +146,13 @@ function App() {
     setDetail(null)
   }
 
+  function setThresholds(newValues) {
+    setThreshold(prev => ({ ...prev, ...newValues }))
+  }
+
   if (!visible) return null
+
+  const criticalCount = hosts.filter(h => (h.queuedCount >= threshold.queued) || (h.heartbeatAge && h.heartbeatAge > threshold.critical)).length
 
   return (
     <div id="mdt">
@@ -143,14 +180,26 @@ function App() {
         </section>
 
         <section className="right">
-          <h2>Hosts</h2>
+          <div className="hosts-header">
+            <h2>Hosts</h2>
+            <div className="alerts">Critical hosts: {criticalCount}</div>
+          </div>
+
+          <MapPanel hosts={hosts} />
+
           <div className="hosts">
             {hosts.length === 0 && <div className="empty">No hosts</div>}
             <ul>
               {hosts.map(h => (
-                <HostRow key={h.hostId} h={h} onOpen={openHostDetail} />
+                <HostRow key={h.hostId} h={h} onOpen={openHostDetail} threshold={threshold} />
               ))}
             </ul>
+          </div>
+
+          <div className="filters">
+            <label>Queue threshold: <input type="number" value={threshold.queued} onChange={(e) => setThresholds({ queued: Number(e.target.value) })} /></label>
+            <label>Warn HB (s): <input type="number" value={threshold.warn} onChange={(e) => setThresholds({ warn: Number(e.target.value) })} /></label>
+            <label>Critical HB (s): <input type="number" value={threshold.critical} onChange={(e) => setThresholds({ critical: Number(e.target.value) })} /></label>
           </div>
 
           <h2>Units for Incident {selectedIncident ? `#${selectedIncident.incident_id || selectedIncident.id}` : ''}</h2>
