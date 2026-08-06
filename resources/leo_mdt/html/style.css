@@ -37,3 +37,8 @@ main { display:flex; gap:12px; margin-top:12px }
 
 .hosts-header { display:flex; justify-content:space-between; align-items:center }
 .alerts { color:#f87171; font-weight:600 }
+
+/* Alerts panel */
+.alerts-panel { margin-top:12px; padding:8px; background:rgba(255,255,255,0.02); border-radius:6px }
+.alerts-panel ul { max-height:150px; overflow:auto; margin:0; padding:0; list-style:none }
+.alerts-panel li { font-size:12px; padding:4px 0 }
