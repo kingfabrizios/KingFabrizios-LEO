@@ -17,3 +17,6 @@ main { display:flex; gap:12px; margin-top:12px }
 .units { padding:8px }
 .units li { padding:8px; border-bottom:1px dashed rgba(255,255,255,0.03) }
 .empty { color:rgba(255,255,255,0.5) }
+.hosts { padding:8px; margin-bottom:12px }
+.hosts li { padding:8px; border-bottom:1px dashed rgba(255,255,255,0.03) }
+.hosts li.stale { opacity:0.6; border-left:4px solid #f59e0b }

@@ -5,6 +5,7 @@ function App() {
   const [incidents, setIncidents] = useState([])
   const [selectedIncident, setSelectedIncident] = useState(null)
   const [units, setUnits] = useState([])
+  const [hosts, setHosts] = useState([])
 
   useEffect(() => {
     window.addEventListener('message', handleMessage)
@@ -30,6 +31,7 @@ function App() {
       })
     }
     if (d.type === 'recentUnits') setUnits(d.units || [])
+    if (d.type === 'hostsStatus') setHosts(d.hosts || [])
   }
 
   function close() {
@@ -41,6 +43,8 @@ function App() {
     setUnits([])
     // request recent units for incident from the client-side script
     fetch('https://leo_mdt/requestUnits', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ incident_id: inc.incident_id || inc.id }) })
+    // also request host status to show health
+    fetch('https://leo_mdt/requestHosts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
   }
 
   function assignUnit() {
@@ -57,6 +61,10 @@ function App() {
     fetch('https://leo_mdt/assignUnit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ incident_id: selectedIncident.incident_id || selectedIncident.id, template: template }) })
   }
 
+  function refreshHosts() {
+    fetch('https://leo_mdt/requestHosts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
+  }
+
   if (!visible) return null
 
   return (
@@ -65,6 +73,7 @@ function App() {
         <h1>MDT Prototype</h1>
         <div className="controls">
           <button onClick={assignUnit} className="primary">Assign Unit</button>
+          <button onClick={refreshHosts}>Refresh Hosts</button>
           <button onClick={close}>Close</button>
         </div>
       </header>
@@ -84,6 +93,20 @@ function App() {
         </section>
 
         <section className="right">
+          <h2>Hosts</h2>
+          <div className="hosts">
+            {hosts.length === 0 && <div className="empty">No hosts</div>}
+            <ul>
+              {hosts.map(h => (
+                <li key={h.hostId} className={h.heartbeatAge && h.heartbeatAge > 12 ? 'stale' : ''}>
+                  <div><strong>Host {h.hostId}</strong> {h.isDedicated ? '(ai_host)' : ''}</div>
+                  <div>Last HB: {h.lastHeartbeat ? new Date(h.lastHeartbeat * 1000).toLocaleString() : 'never'} ({h.heartbeatAge ? `${h.heartbeatAge}s ago` : 'N/A'})</div>
+                  <div>Active: {h.activeCount} | Queued: {h.queuedCount}</div>
+                </li>
+              ))}
+            </ul>
+          </div>
+
           <h2>Units for Incident {selectedIncident ? `#${selectedIncident.incident_id || selectedIncident.id}` : ''}</h2>
           <div className="units">
             {units.length === 0 && <div className="empty">No units</div>}
