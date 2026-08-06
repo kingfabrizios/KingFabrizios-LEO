@@ -1,6 +1,6 @@
 -- resources/leo_ai_units/server.lua
--- Server-side AI unit manager with spawn limits, queuing, DB persistence, host failover and persistent queued assignments.
--- Maintains unit state and requests a client host to spawn AI peds/vehicles.
+-- Server-side AI unit manager with spawn limits, queuing, DB persistence, host failover, persistent queued assignments
+-- and host heartbeat + graceful handoff support.
 
 local activeUnits = {}
 local unitCounter = 0
@@ -15,10 +15,16 @@ local hasOx = exports['oxmysql'] ~= nil
 local MAX_UNITS_PER_HOST = 4
 local MAX_UNITS_PER_INCIDENT = 6
 
+-- Heartbeat & handoff config
+local HEARTBEAT_INTERVAL = 5000         -- clients send heartbeat every 5s (ms)
+local HEARTBEAT_WARN_SEC = 12           -- if no heartbeat for this many seconds, request handoff
+local HEARTBEAT_TIMEOUT_SEC = 22        -- if no heartbeat for this many seconds, consider host dead and reassign
+
 -- runtime counters & queues
 local hostActiveCount = {}         -- hostId -> number of active (spawned) units
 local incidentActiveCount = {}     -- incident_id -> number of active (spawned) units
 local pendingQueue = {}            -- hostId -> list of queued unit objects awaiting spawn on that host
+local lastHeartbeat = {}           -- hostId -> timestamp (os.time()) of last heartbeat seen
 
 local function countPendingForIncident(incident_id)
     local c = 0
@@ -378,6 +384,45 @@ RegisterCommand('leo_assign', function(source, args, raw)
     end
 end, false)
 
+-- Handler: heartbeat from client hosts
+RegisterNetEvent('leo_ai_units:heartbeat')
+AddEventHandler('leo_ai_units:heartbeat', function(data)
+    local src = source
+    if not src then return end
+    lastHeartbeat[src] = os.time()
+    -- Optionally update hostActiveCount if client sends activeCount
+    if data and data.activeCount then
+        hostActiveCount[src] = tonumber(data.activeCount) or hostActiveCount[src] or 0
+    end
+    -- Debug
+    -- print(('[leo_ai_units] heartbeat from %s active=%s'):format(tostring(src), tostring(hostActiveCount[src])))
+end)
+
+-- Handler: host indicates it's ready to hand off its units (sends current unit_ids and positions)
+RegisterNetEvent('leo_ai_units:handoffReady')
+AddEventHandler('leo_ai_units:handoffReady', function(data)
+    local src = source
+    if not src or not data or not data.units then return end
+    print(('[leo_ai_units] HandOffReady received from host %s for %d units'):format(tostring(src), #data.units))
+    -- For each reported unit, mark it as host_lost and try to reassign (exclude old host)
+    for _, uinfo in ipairs(data.units) do
+        local uid = tonumber(uinfo.unit_id)
+        if uid and activeUnits[uid] then
+            local unit = activeUnits[uid]
+            unit.position = uinfo.position
+            unit.status = 'handing_off'
+            -- Immediately attempt reassignment excluding the current host
+            reassignUnit(unit, src)
+        end
+    end
+    -- After processing, ask the client to stop/clean local entities for these units
+    TriggerClientEvent('leo_ai_units:completeHandoff', src, { unit_ids = (function()
+        local ids = {}
+        for _, u in ipairs(data.units) do table.insert(ids, u.unit_id) end
+        return ids
+    end)() })
+end)
+
 -- Handler: client notifies server that it spawned the unit and provides network id
 RegisterNetEvent('leo_ai_units:clientSpawned')
 AddEventHandler('leo_ai_units:clientSpawned', function(data)
@@ -523,9 +568,32 @@ AddEventHandler('playerDropped', function(reason)
     reassignUnitsFromHost(src)
     hostActiveCount[src] = 0
     pendingQueue[src] = nil
+    lastHeartbeat[src] = nil
 end)
 
--- Export simple helper for server code to request assignment
+-- Background thread: monitor host heartbeats and request graceful handoff or reassign
+Citizen.CreateThread(function()
+    while true do
+        local now = os.time()
+        for host, t in pairs(lastHeartbeat) do
+            local age = now - t
+            if age >= HEARTBEAT_TIMEOUT_SEC then
+                print(('[leo_ai_units] Heartbeat timeout for host %s (age=%ds) - forcing reassign'):format(tostring(host), age))
+                reassignUnitsFromHost(host)
+                hostActiveCount[host] = 0
+                pendingQueue[host] = nil
+                lastHeartbeat[host] = nil
+            elseif age >= HEARTBEAT_WARN_SEC then
+                -- send prepareHandoff to host to attempt graceful handoff
+                print(('[leo_ai_units] Heartbeat warn for host %s (age=%ds) - requesting handoff'):format(tostring(host), age))
+                TriggerClientEvent('leo_ai_units:prepareHandoff', host, {})
+            end
+        end
+        Citizen.Wait(3000)
+    end
+end)
+
+-- Export helper
 exports('assignUnitToIncident', assignUnitToIncident)
 
-print('[leo_ai_units] Server with persistent queued assignments loaded')
+print('[leo_ai_units] Server with heartbeats and graceful handoff loaded')
